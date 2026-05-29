@@ -2,15 +2,16 @@ use bytemuck::{Pod, Zeroable};
 use image::{DynamicImage, RgbaImage};
 use wgpu::util::DeviceExt;
 use wgpu::{
-    BindGroupDescriptor, BindGroupEntry, BindGroupLayoutDescriptor, BindGroupLayoutEntry,
-    BindingType, BlendState, BufferBindingType, BufferDescriptor, BufferUsages,
-    COPY_BYTES_PER_ROW_ALIGNMENT, Color, ColorTargetState, ColorWrites, CommandEncoderDescriptor,
-    DeviceDescriptor, Extent3d, FragmentState, ImageCopyBuffer, ImageDataLayout,
-    InstanceDescriptor, LoadOp, Maintain, MapMode, MultisampleState, Operations,
-    PipelineLayoutDescriptor, PowerPreference, PrimitiveState, RenderPassColorAttachment,
-    RenderPassDescriptor, RenderPipelineDescriptor, RequestAdapterOptions, ShaderModuleDescriptor,
+    AddressMode, BindGroupDescriptor, BindGroupEntry, BindGroupLayoutDescriptor,
+    BindGroupLayoutEntry, BindingResource, BindingType, BlendState, BufferBindingType,
+    BufferDescriptor, BufferUsages, COPY_BYTES_PER_ROW_ALIGNMENT, Color, ColorTargetState,
+    ColorWrites, CommandEncoderDescriptor, DeviceDescriptor, Extent3d, FilterMode, FragmentState,
+    ImageCopyBuffer, ImageDataLayout, InstanceDescriptor, LoadOp, Maintain, MapMode,
+    MultisampleState, Operations, PipelineLayoutDescriptor, PowerPreference, PrimitiveState,
+    RenderPassColorAttachment, RenderPassDescriptor, RenderPipelineDescriptor,
+    RequestAdapterOptions, SamplerBindingType, SamplerDescriptor, ShaderModuleDescriptor,
     ShaderSource, ShaderStages, StoreOp, TextureDescriptor, TextureDimension, TextureFormat,
-    TextureUsages, TextureViewDescriptor, VertexState,
+    TextureSampleType, TextureUsages, TextureViewDescriptor, TextureViewDimension, VertexState,
 };
 
 use crate::error::TiedyeError;
@@ -50,7 +51,6 @@ impl Renderer {
         Ok(Self { device, queue })
     }
 
-    #[allow(clippy::too_many_lines)]
     pub fn render(
         &self,
         shader_source: &str,
@@ -61,22 +61,11 @@ impl Renderer {
             .map(|img| (img.width(), img.height()))
             .unwrap_or((512, 512));
 
-        let params = Params { width, height };
+        let output_texture = self.create_output_texture(width, height);
+        let output_view = output_texture.create_view(&TextureViewDescriptor::default());
 
-        let output_texture = self.device.create_texture(&TextureDescriptor {
-            label: Some("output"),
-            size: Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: TextureDimension::D2,
-            format: TextureFormat::Rgba8Unorm,
-            usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::COPY_SRC,
-            view_formats: &[],
-        });
+        let (input_texture, input_view) = self.create_input_texture(input_images.first());
+        let sampler = self.create_sampler();
 
         let shader = self.device.create_shader_module(ShaderModuleDescriptor {
             label: Some("shader"),
@@ -87,25 +76,13 @@ impl Renderer {
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("params"),
-                contents: bytemuck::bytes_of(&params),
+                contents: bytemuck::bytes_of(&Params { width, height }),
                 usage: BufferUsages::UNIFORM,
             });
 
-        let bind_group_layout = self
-            .device
-            .create_bind_group_layout(&BindGroupLayoutDescriptor {
-                label: Some("bind_group_layout"),
-                entries: &[BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: ShaderStages::VERTEX | ShaderStages::FRAGMENT,
-                    ty: BindingType::Buffer {
-                        ty: BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                }],
-            });
+        let bind_group_layout = self.create_bind_group_layout();
+        let bind_group =
+            self.create_bind_group(&bind_group_layout, &uniform_buffer, &input_view, &sampler);
 
         let pipeline_layout = self
             .device
@@ -115,44 +92,7 @@ impl Renderer {
                 push_constant_ranges: &[],
             });
 
-        let pipeline = self
-            .device
-            .create_render_pipeline(&RenderPipelineDescriptor {
-                label: Some("pipeline"),
-                layout: Some(&pipeline_layout),
-                vertex: VertexState {
-                    module: &shader,
-                    entry_point: "vs_main",
-                    buffers: &[],
-                    compilation_options: Default::default(),
-                },
-                fragment: Some(FragmentState {
-                    module: &shader,
-                    entry_point: "fs_main",
-                    targets: &[Some(ColorTargetState {
-                        format: TextureFormat::Rgba8Unorm,
-                        blend: Some(BlendState::REPLACE),
-                        write_mask: ColorWrites::ALL,
-                    })],
-                    compilation_options: Default::default(),
-                }),
-                primitive: PrimitiveState::default(),
-                depth_stencil: None,
-                multisample: MultisampleState::default(),
-                multiview: None,
-                cache: None,
-            });
-
-        let bind_group = self.device.create_bind_group(&BindGroupDescriptor {
-            label: Some("bind_group"),
-            layout: &bind_group_layout,
-            entries: &[BindGroupEntry {
-                binding: 0,
-                resource: uniform_buffer.as_entire_binding(),
-            }],
-        });
-
-        let output_view = output_texture.create_view(&TextureViewDescriptor::default());
+        let pipeline = self.create_pipeline(&shader, &pipeline_layout);
 
         let mut encoder = self
             .device
@@ -175,18 +115,205 @@ impl Renderer {
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
-
             render_pass.set_pipeline(&pipeline);
             render_pass.set_bind_group(0, &bind_group, &[]);
             render_pass.draw(0..3, 0..1);
         }
 
-        let bytes_per_pixel = 4u32;
-        let unpadded_bytes_per_row = width * bytes_per_pixel;
-        let padded_bytes_per_row = unpadded_bytes_per_row.div_ceil(COPY_BYTES_PER_ROW_ALIGNMENT)
-            * COPY_BYTES_PER_ROW_ALIGNMENT;
+        let (output_buffer, padded_bytes_per_row) =
+            self.copy_texture_to_buffer(&mut encoder, &output_texture, width, height);
 
-        let output_buffer = self.device.create_buffer(&BufferDescriptor {
+        self.queue.submit(std::iter::once(encoder.finish()));
+
+        // Keep input_texture alive until submission is complete.
+        drop(input_texture);
+
+        self.read_back_image(output_buffer, width, height, padded_bytes_per_row)
+    }
+
+    fn create_output_texture(&self, width: u32, height: u32) -> wgpu::Texture {
+        self.device.create_texture(&TextureDescriptor {
+            label: Some("output"),
+            size: Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: TextureDimension::D2,
+            format: TextureFormat::Rgba8Unorm,
+            usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::COPY_SRC,
+            view_formats: &[],
+        })
+    }
+
+    fn create_input_texture(
+        &self,
+        image: Option<&DynamicImage>,
+    ) -> (wgpu::Texture, wgpu::TextureView) {
+        let (width, height, pixels): (u32, u32, Vec<u8>) = match image {
+            Some(img) => {
+                let rgba = img.to_rgba8();
+                let (w, h) = rgba.dimensions();
+                (w, h, rgba.into_raw())
+            }
+            None => (1, 1, vec![0, 0, 0, 255]),
+        };
+
+        let texture = self.device.create_texture(&TextureDescriptor {
+            label: Some("input_texture"),
+            size: Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: TextureDimension::D2,
+            format: TextureFormat::Rgba8Unorm,
+            usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+
+        self.queue.write_texture(
+            texture.as_image_copy(),
+            &pixels,
+            ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(width * 4),
+                rows_per_image: None,
+            },
+            Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+
+        let view = texture.create_view(&TextureViewDescriptor::default());
+        (texture, view)
+    }
+
+    fn create_sampler(&self) -> wgpu::Sampler {
+        self.device.create_sampler(&SamplerDescriptor {
+            label: Some("input_sampler"),
+            address_mode_u: AddressMode::ClampToEdge,
+            address_mode_v: AddressMode::ClampToEdge,
+            address_mode_w: AddressMode::ClampToEdge,
+            mag_filter: FilterMode::Linear,
+            min_filter: FilterMode::Linear,
+            mipmap_filter: FilterMode::Nearest,
+            ..Default::default()
+        })
+    }
+
+    fn create_bind_group_layout(&self) -> wgpu::BindGroupLayout {
+        self.device
+            .create_bind_group_layout(&BindGroupLayoutDescriptor {
+                label: Some("bind_group_layout"),
+                entries: &[
+                    BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: ShaderStages::VERTEX | ShaderStages::FRAGMENT,
+                        ty: BindingType::Buffer {
+                            ty: BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: ShaderStages::FRAGMENT,
+                        ty: BindingType::Texture {
+                            multisampled: false,
+                            view_dimension: TextureViewDimension::D2,
+                            sample_type: TextureSampleType::Float { filterable: true },
+                        },
+                        count: None,
+                    },
+                    BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: ShaderStages::FRAGMENT,
+                        ty: BindingType::Sampler(SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                ],
+            })
+    }
+
+    fn create_bind_group(
+        &self,
+        layout: &wgpu::BindGroupLayout,
+        uniform_buffer: &wgpu::Buffer,
+        input_view: &wgpu::TextureView,
+        sampler: &wgpu::Sampler,
+    ) -> wgpu::BindGroup {
+        self.device.create_bind_group(&BindGroupDescriptor {
+            label: Some("bind_group"),
+            layout,
+            entries: &[
+                BindGroupEntry {
+                    binding: 0,
+                    resource: uniform_buffer.as_entire_binding(),
+                },
+                BindGroupEntry {
+                    binding: 1,
+                    resource: BindingResource::TextureView(input_view),
+                },
+                BindGroupEntry {
+                    binding: 2,
+                    resource: BindingResource::Sampler(sampler),
+                },
+            ],
+        })
+    }
+
+    fn create_pipeline(
+        &self,
+        shader: &wgpu::ShaderModule,
+        layout: &wgpu::PipelineLayout,
+    ) -> wgpu::RenderPipeline {
+        self.device
+            .create_render_pipeline(&RenderPipelineDescriptor {
+                label: Some("pipeline"),
+                layout: Some(layout),
+                vertex: VertexState {
+                    module: shader,
+                    entry_point: "vs_main",
+                    buffers: &[],
+                    compilation_options: Default::default(),
+                },
+                fragment: Some(FragmentState {
+                    module: shader,
+                    entry_point: "fs_main",
+                    targets: &[Some(ColorTargetState {
+                        format: TextureFormat::Rgba8Unorm,
+                        blend: Some(BlendState::REPLACE),
+                        write_mask: ColorWrites::ALL,
+                    })],
+                    compilation_options: Default::default(),
+                }),
+                primitive: PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: MultisampleState::default(),
+                multiview: None,
+                cache: None,
+            })
+    }
+
+    fn copy_texture_to_buffer(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        texture: &wgpu::Texture,
+        width: u32,
+        height: u32,
+    ) -> (wgpu::Buffer, u32) {
+        let padded_bytes_per_row =
+            (width * 4).div_ceil(COPY_BYTES_PER_ROW_ALIGNMENT) * COPY_BYTES_PER_ROW_ALIGNMENT;
+
+        let buffer = self.device.create_buffer(&BufferDescriptor {
             label: Some("output_buffer"),
             size: (padded_bytes_per_row * height) as u64,
             usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
@@ -194,9 +321,9 @@ impl Renderer {
         });
 
         encoder.copy_texture_to_buffer(
-            output_texture.as_image_copy(),
+            texture.as_image_copy(),
             ImageCopyBuffer {
-                buffer: &output_buffer,
+                buffer: &buffer,
                 layout: ImageDataLayout {
                     offset: 0,
                     bytes_per_row: Some(padded_bytes_per_row),
@@ -210,25 +337,30 @@ impl Renderer {
             },
         );
 
-        self.queue.submit(std::iter::once(encoder.finish()));
+        (buffer, padded_bytes_per_row)
+    }
 
-        let buffer_slice = output_buffer.slice(..);
-        buffer_slice.map_async(MapMode::Read, |_| {});
+    fn read_back_image(
+        &self,
+        buffer: wgpu::Buffer,
+        width: u32,
+        height: u32,
+        padded_bytes_per_row: u32,
+    ) -> Result<RgbaImage, TiedyeError> {
+        let slice = buffer.slice(..);
+        slice.map_async(MapMode::Read, |_| {});
         self.device.poll(Maintain::Wait);
 
-        let padded_data = buffer_slice.get_mapped_range();
-        let mut image_data = Vec::with_capacity((width * height * 4) as usize);
-
+        let mapped = slice.get_mapped_range();
+        let mut pixels = Vec::with_capacity((width * height * 4) as usize);
         for row in 0..height {
-            let row_start = (row * padded_bytes_per_row) as usize;
-            let row_end = row_start + (width * bytes_per_pixel) as usize;
-            image_data.extend_from_slice(&padded_data[row_start..row_end]);
+            let start = (row * padded_bytes_per_row) as usize;
+            pixels.extend_from_slice(&mapped[start..start + (width * 4) as usize]);
         }
+        drop(mapped);
+        buffer.unmap();
 
-        drop(padded_data);
-        output_buffer.unmap();
-
-        RgbaImage::from_raw(width, height, image_data).ok_or_else(|| {
+        RgbaImage::from_raw(width, height, pixels).ok_or_else(|| {
             TiedyeError::IoError(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "failed to create image from GPU output",

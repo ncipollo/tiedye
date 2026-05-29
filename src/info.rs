@@ -42,6 +42,16 @@ struct Params { width: u32, height: u32 }
 | `clamp(x, lo, hi)`     | clamp value to range               |
 | `mix(a, b, t)`         | linear interpolation               |
 
+## Bindings Reference
+
+| Group | Binding | Type                   | Description                         |
+|-------|---------|------------------------|-------------------------------------|
+| 0     | 0       | `uniform Params`       | Output dimensions                   |
+| 0     | 1       | `texture_2d<f32>`      | First input image (when provided)   |
+| 0     | 2       | `sampler`              | Sampler for the input texture       |
+
+Texture bindings 1 and 2 are only present when at least one image is passed as an argument.
+
 ## Simple Example
 
 ```wgsl
@@ -62,6 +72,33 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     return vec4(uv.x, uv.y, 0.5, 1.0); // red=x, green=y gradient
 }
 ```
+
+## Input Image Example
+
+Sample from the first input image passed on the command line:
+
+```wgsl
+struct Params { width: u32, height: u32 }
+@group(0) @binding(0) var<uniform> params: Params;
+@group(0) @binding(1) var input_texture: texture_2d<f32>;
+@group(0) @binding(2) var input_sampler: sampler;
+
+@vertex
+fn vs_main(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
+    var pos = array<vec2<f32>, 3>(
+        vec2(-1.0, -1.0), vec2(3.0, -1.0), vec2(-1.0, 3.0),
+    );
+    return vec4(pos[i], 0.0, 1.0);
+}
+
+@fragment
+fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
+    let uv = pos.xy / vec2(f32(params.width), f32(params.height));
+    return textureSample(input_texture, input_sampler, uv);
+}
+```
+
+Invoke with: `tiedye effect.wgsl photo.png --output result.png`
 
 ## Output
 
