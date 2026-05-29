@@ -1,0 +1,25 @@
+[package]
+name = "tiedye"
+description = "GPU shader tool for applying tiedye effects to images."
+edition = "2024"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/ncipollo/tiedye"
+version = "0.1.0"
+
+[[bin]]
+name = "tiedye"
+path = "src/main.rs"
+
+[dependencies]
+bytemuck = { version = "1.21.0", features = ["derive"] }
+clap = { version = "4.5.60", features = ["derive"] }
+image = "0.25.5"
+pollster = "0.3.0"
+thiserror = "2.0.18"
+wgpu = "22.1.0"
+
+[lints.clippy]
+cognitive_complexity = "warn"
+too_many_lines = "warn"
+too_many_arguments = "warn"
