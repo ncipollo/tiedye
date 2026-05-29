@@ -4,8 +4,13 @@ use std::path::PathBuf;
 #[derive(Debug, Parser)]
 #[command(name = "tiedye", about = "Apply GPU shaders to create tiedye effects")]
 pub struct Cli {
+    /// Print usage documentation in markdown (useful for AI agents)
+    #[arg(long)]
+    pub info: bool,
+
     /// Path to the WGSL shader file
-    pub shader: PathBuf,
+    #[arg(required_unless_present = "info")]
+    pub shader: Option<PathBuf>,
 
     /// Optional input image(s) to apply the shader to
     pub images: Vec<PathBuf>,
