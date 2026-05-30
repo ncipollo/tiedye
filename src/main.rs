@@ -38,7 +38,10 @@ fn main() -> Result<(), TiedyeError> {
         output_image
             .write_to(&mut Cursor::new(&mut buf), image::ImageFormat::Png)
             .map_err(TiedyeError::from)?;
-        io::stdout().lock().write_all(&buf).map_err(TiedyeError::from)?;
+        io::stdout()
+            .lock()
+            .write_all(&buf)
+            .map_err(TiedyeError::from)?;
     } else {
         output_image
             .save(PathBuf::from("output.png"))
